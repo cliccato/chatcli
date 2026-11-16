@@ -1,139 +1,258 @@
+// chatcli is a terminal client for the ch.at service.
 package main
 
 import (
 	"bufio"
-	"bytes"
+	"context"
+	"errors"
+	"flag"
 	"fmt"
-	"io"
-	"net/http"
-	"net/url"
 	"os"
+	"os/signal"
 	"strings"
+
+	"github.com/cliccato/chatcli/internal/api"
+	"github.com/cliccato/chatcli/internal/session"
+	"github.com/cliccato/chatcli/internal/tui"
 )
 
-const (
-	URLStr       = "https://ch.at/"
-	MaxHistorySz = 64 * 1024 // 64 KB
-)
-
-var (
-	history string
-	client  = &http.Client{}
-
-	// ANSI color codes
-	colorReset  = "\033[0m"
-	colorCyan   = "\033[96m"
-	colorGreen  = "\033[92m"
-	colorYellow = "\033[93m"
-	colorRed    = "\033[91m"
-)
-
-// sendRequest invia una POST form urlencoded con parametri q e h e ritorna la risposta come stringa.
-func sendRequest(q, h string) (string, error) {
-	form := url.Values{}
-	form.Set("q", q)
-	form.Set("h", h)
-
-	req, err := http.NewRequest("POST", URLStr, strings.NewReader(form.Encode()))
-	if err != nil {
-		return "", err
-	}
-
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "+
-		"AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36")
-
-	resp, err := client.Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return "", fmt.Errorf("HTTP error: %s", resp.Status)
-	}
-
-	bodyBytes, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return "", err
-	}
-
-	return strings.TrimSpace(string(bodyBytes)), nil
-}
-
-// extractLastAnswer estrae l'ultima risposta (testo dopo ultimo "A:") dalla risposta completa.
-func extractLastAnswer(fullResponse string) string {
-	lines := strings.Split(fullResponse, "\n")
-	var lastAnswerLines []string
-	found := false
-
-	for i := len(lines) - 1; i >= 0; i-- {
-		trimmed := strings.TrimSpace(lines[i])
-		if strings.HasPrefix(trimmed, "A:") {
-			lastAnswerLines = append([]string{strings.TrimSpace(trimmed[2:])}, lastAnswerLines...)
-			found = true
-		} else if found {
-			break
-		}
-	}
-
-	if !found {
-		return strings.TrimSpace(fullResponse)
-	}
-
-	return strings.Join(lastAnswerLines, " ")
-}
-
-func printPrompt() {
-	fmt.Print(colorCyan + "You: " + colorReset)
-}
-
-func printResponse(answer string) {
-	// Solo il prefisso 'ch.at >' è verde, risposta senza colore
-	fmt.Println(colorGreen + "ch.at: " + colorReset + answer)
-}
+const inputLimit = 1 << 20 // longest line accepted on stdin
 
 func main() {
-	scanner := bufio.NewScanner(os.Stdin)
+	name := flag.String("session", "default", "session name")
+	once := flag.Bool("once", false, "ask the opening question, print the answer and exit")
+	list := flag.Bool("list", false, "list saved sessions")
+	clear := flag.Bool("clear", false, "clear the session history and exit")
+	flag.Usage = usage
+	flag.Parse()
 
+	tui.Init()
+
+	store, err := session.Open()
+	if err != nil {
+		fatal(err)
+	}
+
+	switch {
+	case *list:
+		listSessions(store, "")
+		return
+	case *clear:
+		sess, err := store.Load(*name)
+		if err != nil {
+			fatal(err)
+		}
+		if err := store.Save(&session.Session{Name: sess.Name}); err != nil {
+			fatal(err)
+		}
+		fmt.Printf("session %q cleared\n", sess.Name)
+		return
+	}
+
+	sess, err := store.Load(*name)
+	if err != nil {
+		fatal(err)
+	}
+	if h, trimmed := session.Trim(sess.History, api.MaxHistory); trimmed {
+		sess.History = h
+	}
+
+	app := &app{client: api.NewClient(), store: store, sess: sess}
+	app.run(strings.Join(flag.Args(), " "), *once)
+}
+
+type app struct {
+	client *api.Client
+	store  *session.Store
+	sess   *session.Session
+}
+
+// run sends the optional opening question, then reads stdin until exit.
+func (a *app) run(initial string, once bool) {
+	if initial == "" && once {
+		tui.Warn("-once needs a question")
+		return
+	}
+	if initial != "" {
+		a.ask(initial)
+	}
+	if once {
+		return
+	}
+
+	scanner := bufio.NewScanner(os.Stdin)
+	scanner.Buffer(make([]byte, 0, 64*1024), inputLimit)
 	for {
-		printPrompt()
+		tui.Prompt()
 		if !scanner.Scan() {
 			fmt.Println()
 			break
 		}
-		userInput := strings.TrimSpace(scanner.Text())
-		if userInput == "" {
-			continue
+		line := strings.TrimSpace(scanner.Text())
+		switch {
+		case line == "":
+		case isQuit(line):
+			fmt.Println("Goodbye!")
+			return
+		case strings.HasPrefix(line, "/"):
+			if a.command(line) {
+				return
+			}
+		default:
+			a.ask(line)
 		}
-
-		lowerInput := strings.ToLower(userInput)
-		if lowerInput == "exit" || lowerInput == "quit" {
-			fmt.Println("Exiting chat. Goodbye!")
-			break
-		}
-
-		if len([]byte(history)) > MaxHistorySz {
-			fmt.Println(colorYellow + "History too long, resetting chat history..." + colorReset)
-			history = ""
-		}
-
-		response, err := sendRequest(userInput, history)
-		if err != nil {
-			fmt.Println(colorRed+"[Error during request:", err, "]"+colorReset)
-			continue
-		}
-
-		lastAnswer := extractLastAnswer(response)
-
-		historyBuf := bytes.NewBufferString(history)
-		historyBuf.WriteString(fmt.Sprintf("Q: %s\nA: %s\n\n", userInput, lastAnswer))
-		history = historyBuf.String()
-
-		printResponse(lastAnswer)
 	}
-
 	if err := scanner.Err(); err != nil {
-		fmt.Fprintln(os.Stderr, "Error reading standard input:", err)
+		tui.Error(fmt.Errorf("input: %w", err))
 	}
+}
+
+// ask sends one question and streams the answer to stdout.
+func (a *app) ask(question string) {
+	ctx, stop := cancelOnInterrupt(context.Background())
+	defer stop()
+
+	printed := false
+	answer, err := a.client.Ask(ctx, question, a.sess.History, func(p []byte) {
+		if !printed {
+			tui.AnswerPrefix()
+			printed = true
+		}
+		tui.Write(p)
+	})
+	if printed {
+		fmt.Println()
+	}
+	if errors.Is(ctx.Err(), context.Canceled) {
+		tui.Warn("request canceled")
+		return
+	}
+	if err != nil {
+		tui.Error(err)
+		return
+	}
+	if answer == "" {
+		return
+	}
+	if trimmed := a.sess.Append(question, answer, api.MaxHistory); trimmed {
+		tui.Warn("context trimmed to the newest exchanges")
+	}
+	if err := a.store.Save(a.sess); err != nil {
+		tui.Warn("saving session: %v", err)
+	}
+}
+
+// command handles "/" lines and reports whether the chat must stop.
+func (a *app) command(line string) bool {
+	cmd, arg, _ := strings.Cut(line, " ")
+	cmd = strings.ToLower(cmd)
+	arg = strings.TrimSpace(arg)
+
+	switch cmd {
+	case "/help":
+		fmt.Print(helpText)
+	case "/sessions":
+		listSessions(a.store, a.sess.Name)
+	case "/session":
+		if arg == "" {
+			tui.Warn("usage: /session <name>")
+			return false
+		}
+		if err := a.store.Save(a.sess); err != nil {
+			tui.Warn("saving session: %v", err)
+			return false
+		}
+		sess, err := a.store.Load(arg)
+		if err != nil {
+			tui.Warn("%v", err)
+			return false
+		}
+		if h, _ := session.Trim(sess.History, api.MaxHistory); h != sess.History {
+			sess.History = h
+		}
+		a.sess = sess
+		fmt.Printf("session %q loaded (%d bytes of context)\n", sess.Name, len(sess.History))
+	case "/new":
+		a.sess.History = ""
+		if err := a.store.Save(a.sess); err != nil {
+			tui.Warn("saving session: %v", err)
+			return false
+		}
+		fmt.Printf("session %q cleared\n", a.sess.Name)
+	case "/history":
+		if strings.TrimSpace(a.sess.History) == "" {
+			fmt.Println("empty history")
+			return false
+		}
+		fmt.Print(a.sess.History)
+	case "/exit", "/quit":
+		return true
+	default:
+		tui.Warn("unknown command %q, try /help", cmd)
+	}
+	return false
+}
+
+func isQuit(line string) bool {
+	switch strings.ToLower(line) {
+	case "exit", "quit", "/exit", "/quit":
+		return true
+	}
+	return false
+}
+
+func listSessions(store *session.Store, current string) {
+	infos, err := store.List()
+	if err != nil {
+		fatal(err)
+	}
+	if len(infos) == 0 {
+		fmt.Println("no saved sessions")
+		return
+	}
+	for _, info := range infos {
+		mark := " "
+		if info.Name == current {
+			mark = "*"
+		}
+		fmt.Printf("%s %-24s %8d B  %s\n", mark, info.Name, info.Bytes, info.ModTime.Format("2006-01-02 15:04"))
+	}
+}
+
+// cancelOnInterrupt aborts the running request on the first Ctrl-C.
+func cancelOnInterrupt(parent context.Context) (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithCancel(parent)
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, os.Interrupt)
+	go func() {
+		select {
+		case <-sig:
+			cancel()
+		case <-ctx.Done():
+		}
+		signal.Stop(sig)
+	}()
+	return ctx, cancel
+}
+
+func fatal(err error) {
+	tui.Error(err)
+	os.Exit(1)
+}
+
+const helpText = `commands:
+  /help              show this help
+  /sessions          list saved sessions
+  /session <name>    switch to another session
+  /new               clear the current session context
+  /history           print the current transcript
+  /exit              quit (also: exit, quit)
+
+usage: chatcli [flags] [question...]
+`
+
+func usage() {
+	fmt.Fprint(flag.CommandLine.Output(), "chatcli - terminal client for ch.at\n\n")
+	flag.PrintDefaults()
+	fmt.Fprint(flag.CommandLine.Output(), "\n"+helpText)
 }
